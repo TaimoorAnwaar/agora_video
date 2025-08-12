@@ -1,43 +1,56 @@
 "use client";
 import React, { useEffect, useRef, useState } from 'react';
-import { useParams } from 'next/navigation';
+import { useParams, useRouter } from 'next/navigation';
 import type { ILocalAudioTrack, ILocalVideoTrack, IAgoraRTCRemoteUser, ILocalTrack } from 'agora-rtc-sdk-ng';
 import axios from 'axios';
 
 export default function CallPage() {
   const params = useParams<{ room: string }>();
   const room = params?.room;
+  const router = useRouter();
   const localVideoRef = useRef<HTMLDivElement>(null);
   const remoteVideoRef = useRef<HTMLDivElement>(null);
 
   const [joined, setJoined] = useState(false);
   const clientRef = useRef<any | null>(null);
+  const screenClientRef = useRef<any | null>(null);
   const [localTracks, setLocalTracks] = useState<{video?: ILocalVideoTrack, audio?: ILocalAudioTrack}>({});
   const [screenTrack, setScreenTrack] = useState<ILocalTrack | null>(null);
   const [micEnabled, setMicEnabled] = useState(true);
   const [camEnabled, setCamEnabled] = useState(true);
   const [isScreenSharing, setIsScreenSharing] = useState(false);
+  const [isTogglingScreen, setIsTogglingScreen] = useState(false);
   const [isJoining, setIsJoining] = useState(false);
   const eventsBoundRef = useRef(false);
+  const didAutoJoinRef = useRef(false);
+  const cleanupOnUnloadRef = useRef<() => Promise<void>>(async () => {});
+  const appIdRef = useRef<string | null>(null);
+  const channelRef = useRef<string | null>(null);
+  const uidRef = useRef<number | null>(null);
 
-  // Do not auto-join. Only clean up if leaving the page while joined.
+  // Simple pre-join: just a Join button (lobby handles waiting/countdown)
+
+  // Cleanup on unmount is handled via cleanupOnUnloadRef effect below.
+
+  // No waiting logic here; lobby controls timing
   useEffect(() => {
-    return () => {
-      if (joined) {
-        // Best-effort cleanup
-        leave();
-      }
-      // Clean up screen sharing if active
-      if (screenTrack) {
-        try {
-          screenTrack.stop();
-          screenTrack.close();
-        } catch (err) {
-          console.error('Error cleaning up screen track:', err);
-        }
-      }
-    };
-  }, [joined, screenTrack]);
+    if (didAutoJoinRef.current) return;
+    didAutoJoinRef.current = true;
+    // Auto-join when page loads
+    // eslint-disable-next-line @typescript-eslint/no-floating-promises
+    join();
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [room]);
+
+  // Ensure local video renders once container exists
+  useEffect(() => {
+    const videoTrack = localTracks.video;
+    if (joined && videoTrack && localVideoRef.current) {
+      try {
+        videoTrack.play(localVideoRef.current);
+      } catch {}
+    }
+  }, [joined, localTracks.video]);
 
   async function join() {
     if (isJoining || joined) return;
@@ -52,7 +65,22 @@ export default function CallPage() {
       setIsJoining(false);
       return;
     }
-    const tokenRes = await axios.get(`${api}/agora/token`, { params: { channel: room, uid } });
+    let tokenRes;
+    try {
+      tokenRes = await axios.get(`${api}/agora/token`, { params: { channel: room, uid } });
+    } catch (err: any) {
+      const status = err?.response?.status;
+      const code = err?.response?.data?.message || err?.response?.data || '';
+      if (status === 403 && code === 'meeting_not_started') {
+        alert('This meeting has not started yet. Please join at the scheduled time.');
+      } else if (status === 403 && code === 'meeting_ended') {
+        alert('This meeting has ended.');
+      } else {
+        alert('Failed to get token. Please try again later.');
+      }
+      setIsJoining(false);
+      return;
+    }
     const token = tokenRes.data.token;
     const appId = tokenRes.data.appId as string | undefined;
     if (!token || !appId) {
@@ -60,6 +88,9 @@ export default function CallPage() {
       setIsJoining(false);
       return;
     }
+    appIdRef.current = appId;
+    channelRef.current = String(room);
+    uidRef.current = uid;
 
     const { default: AgoraRTC } = await import('agora-rtc-sdk-ng');
     // Silence SDK logs and disable telemetry upload to avoid network calls to statscollector
@@ -95,13 +126,19 @@ export default function CallPage() {
         return;
       }
 
-      const localAudioTrack = await AgoraRTC.createMicrophoneAudioTrack();
-      const localVideoTrack = await AgoraRTC.createCameraVideoTrack();
-
-      setLocalTracks({ audio: localAudioTrack, video: localVideoTrack });
-
-      localVideoTrack.play(localVideoRef.current!);
-      await client.publish([localAudioTrack, localVideoTrack]);
+      // Create and publish tracks
+      const [mic, cam] = await Promise.all([
+        AgoraRTC.createMicrophoneAudioTrack(),
+        AgoraRTC.createCameraVideoTrack(),
+      ]);
+      setLocalTracks({ audio: mic, video: cam });
+      await mic.setEnabled(micEnabled);
+      await cam.setEnabled(camEnabled);
+      await client.publish([mic, cam]);
+      // After publishing, ensure playback in the UI
+      if (localVideoRef.current) {
+        try { cam.play(localVideoRef.current); } catch {}
+      }
 
       if (!eventsBoundRef.current) {
         client.on('user-published', async (user: IAgoraRTCRemoteUser, mediaType: 'audio' | 'video') => {
@@ -135,10 +172,24 @@ export default function CallPage() {
   async function leave() {
     const client = clientRef.current;
     try {
-      // Stop screen sharing if active
-      if (screenTrack) {
+      const hadScreenClient = !!screenClientRef.current;
+      // Stop screen sharing client if active
+      if (screenClientRef.current) {
         try {
-          await client.unpublish(screenTrack);
+          if (screenTrack) {
+            try { await screenClientRef.current.unpublish([screenTrack]); } catch {}
+            try { screenTrack.stop(); screenTrack.close(); } catch {}
+          }
+          try { await screenClientRef.current.leave(); } catch {}
+        } catch {}
+        screenClientRef.current = null;
+      }
+      // Stop screen sharing if active
+      if (!hadScreenClient && screenTrack) {
+        try {
+          if (client && client.connectionState === 'CONNECTED') {
+            await client.unpublish([screenTrack]);
+          }
           screenTrack.stop();
           screenTrack.close();
         } catch (err) {
@@ -160,7 +211,47 @@ export default function CallPage() {
     }
     setJoined(false);
     eventsBoundRef.current = false;
+    // Redirect to home after leaving
+    router.push('/');
   }
+
+  // Ensure tracks are released if user navigates away without clicking Leave
+  useEffect(() => {
+    cleanupOnUnloadRef.current = async () => {
+      try {
+        const client = clientRef.current;
+        const sClient = screenClientRef.current;
+        // Stop screen sharing if active
+        if (screenTrack) {
+          try {
+            if (sClient) {
+              try { await sClient.unpublish([screenTrack]); } catch {}
+            } else if (client && client.connectionState === 'CONNECTED') {
+              try { await client.unpublish([screenTrack]); } catch {}
+            }
+          } catch {}
+          try { screenTrack.stop(); screenTrack.close(); } catch {}
+        }
+        try { await sClient?.leave?.(); } catch {}
+        screenClientRef.current = null;
+
+        // Stop local tracks and leave main client
+        const tracks = Object.values(localTracks).filter(Boolean) as Array<ILocalAudioTrack | ILocalVideoTrack>;
+        try { if (tracks.length) await client?.unpublish?.(tracks); } catch {}
+        tracks.forEach(t => { try { t.stop?.(); t.close?.(); } catch {} });
+        try { await client?.leave?.(); } catch {}
+      } catch {}
+    };
+  }, [localTracks, screenTrack]);
+
+  useEffect(() => {
+    const handler = () => { void cleanupOnUnloadRef.current(); };
+    window.addEventListener('beforeunload', handler);
+    return () => {
+      window.removeEventListener('beforeunload', handler);
+      void cleanupOnUnloadRef.current();
+    };
+  }, []);
 
   async function toggleMic() {
     if (!localTracks.audio) return;
@@ -177,62 +268,95 @@ export default function CallPage() {
   }
 
   async function toggleScreenShare() {
+    if (isTogglingScreen) return;
+    setIsTogglingScreen(true);
+    const mainClient = clientRef.current;
+    if (!mainClient || !joined || mainClient.connectionState !== 'CONNECTED') {
+      alert('Not connected yet. Please wait until you are fully joined before screen sharing.');
+      setIsTogglingScreen(false);
+      return;
+    }
+    const appId = appIdRef.current;
+    const channel = channelRef.current;
+    if (!appId || !channel) {
+      alert('Missing appId/channel in memory. Please rejoin the call.');
+      setIsTogglingScreen(false);
+      return;
+    }
     if (!isScreenSharing) {
       try {
         const { default: AgoraRTC } = await import('agora-rtc-sdk-ng');
-        const screenTrack = await AgoraRTC.createScreenVideoTrack({
+        const created = await AgoraRTC.createScreenVideoTrack({
           encoderConfig: '1080p_1',
           optimizationMode: 'detail'
         });
+        const actualScreenTrack = Array.isArray(created) ? created[0] : created;
         
-        // Handle both single track and array of tracks
-        const actualScreenTrack = Array.isArray(screenTrack) ? screenTrack[0] : screenTrack;
+        // Create a dedicated client for screen sharing
+        const hostname = typeof window !== 'undefined' ? window.location.hostname : '';
+        const usingNgrok = /ngrok/.test(hostname);
+        const apiBase = process.env.NEXT_PUBLIC_API_URL || `${window.location.protocol}//${hostname}:3000`;
+        if (!process.env.NEXT_PUBLIC_API_URL && usingNgrok) {
+          alert('Missing NEXT_PUBLIC_API_URL for ngrok. Set NEXT_PUBLIC_API_URL to your backend ngrok HTTPS URL in frontend/.env.local and restart the frontend.');
+          setIsTogglingScreen(false);
+          try { actualScreenTrack.stop(); actualScreenTrack.close(); } catch {}
+          return;
+        }
+
+        const screenUid = Math.floor(Math.random() * 1000000) + 1000000;
+        let tokenRes2;
+        try {
+          tokenRes2 = await axios.get(`${apiBase}/agora/token`, { params: { channel, uid: screenUid } });
+        } catch (err: any) {
+          alert('Failed to get token for screen share. Please try again.');
+          setIsTogglingScreen(false);
+          try { actualScreenTrack.stop(); actualScreenTrack.close(); } catch {}
+          return;
+        }
+        const token2 = tokenRes2.data?.token as string | undefined;
+        if (!token2) {
+          alert('Server did not return a valid token for screen share.');
+          setIsTogglingScreen(false);
+          try { actualScreenTrack.stop(); actualScreenTrack.close(); } catch {}
+          return;
+        }
+
+        const screenClient = AgoraRTC.createClient({ mode: 'rtc', codec: 'vp8' });
+        screenClientRef.current = screenClient;
+        await screenClient.join(appId, channel, token2, screenUid);
+        await screenClient.publish([actualScreenTrack]);
+
         setScreenTrack(actualScreenTrack);
         setIsScreenSharing(true);
         
-        // Publish screen track
-        await clientRef.current.publish(actualScreenTrack);
-        
-        // Show screen share in local video area
         if (localVideoRef.current) {
           actualScreenTrack.play(localVideoRef.current);
         }
-        
-        // Hide camera video temporarily
-        if (localTracks.video) {
-          localTracks.video.setEnabled(false);
-        }
-        
       } catch (err: any) {
         console.error('Failed to start screen sharing:', err);
-        if (err.message?.includes('Permission denied')) {
+        if (err?.message?.includes('Permission denied')) {
           alert('Screen sharing permission denied. Please allow screen sharing access.');
         } else {
-          alert('Failed to start screen sharing: ' + err.message);
+          alert('Failed to start screen sharing: ' + (err?.message || String(err)));
         }
+      } finally {
+        setIsTogglingScreen(false);
       }
     } else {
       try {
-        // Stop screen sharing
-        if (screenTrack) {
-          await clientRef.current.unpublish(screenTrack);
-          screenTrack.stop();
-          screenTrack.close();
-          setScreenTrack(null);
+        const sClient = screenClientRef.current;
+        if (screenTrack && sClient) {
+          try { await sClient.unpublish([screenTrack]); } catch {}
+          try { screenTrack.stop(); screenTrack.close(); } catch {}
         }
-        
+        try { await sClient?.leave?.(); } catch {}
+        screenClientRef.current = null;
+        setScreenTrack(null);
         setIsScreenSharing(false);
-        
-        // Show camera video again
-        if (localTracks.video) {
-          localTracks.video.setEnabled(true);
-          if (localVideoRef.current) {
-            localTracks.video.play(localVideoRef.current);
-          }
-        }
-        
       } catch (err) {
         console.error('Failed to stop screen sharing:', err);
+      } finally {
+        setIsTogglingScreen(false);
       }
     }
   }
@@ -243,37 +367,40 @@ export default function CallPage() {
         <h2 className="title">Room: <span className="pill">{room}</span></h2>
       </header>
 
-      <section className="grid">
-        <div className="panel">
-          <h4 className="panel-title">
-            {isScreenSharing ? 'Screen Sharing' : 'Your Video'}
-            {isScreenSharing && <span className="screen-share-indicator">● LIVE</span>}
-          </h4>
-          <div ref={localVideoRef} className="video-box" />
-        </div>
-        <div className="panel">
-          <h4 className="panel-title">Remote Camera</h4>
-          <div ref={remoteVideoRef} className="video-box remote" />
-        </div>
-      </section>
+      {joined ? (
+        <>
+          <section className="grid">
+            <div className="panel">
+              <h4 className="panel-title">
+                {isScreenSharing ? 'Screen Sharing' : 'Your Video'}
+                {isScreenSharing && <span className="screen-share-indicator">● LIVE</span>}
+              </h4>
+              <div ref={localVideoRef} className="video-box">
+                <div id="local-fallback" style={{color:'#94a3b8',fontSize:12,padding:8}}>If your camera preview does not appear, try toggling camera or rejoining.</div>
+              </div>
+            </div>
+            <div className="panel">
+              <h4 className="panel-title">Remote Camera</h4>
+              <div ref={remoteVideoRef} className="video-box remote">
+                <div id="remote-fallback" style={{color:'#94a3b8',fontSize:12,padding:8}}>Waiting for the other participant to join…</div>
+              </div>
+            </div>
+          </section>
 
-      <div className="controls">
-        {joined ? (
-          <>
+          <div className="controls">
             <button className="btn btn-danger" onClick={leave}>Leave</button>
             <button className="btn" onClick={toggleMic}>{micEnabled ? 'Mute Mic' : 'Unmute Mic'}</button>
             <button className="btn" onClick={toggleCam}>{camEnabled ? 'Turn Camera Off' : 'Turn Camera On'}</button>
             <button 
               className={`btn ${isScreenSharing ? 'btn-warning' : 'btn-success'}`} 
               onClick={toggleScreenShare}
+              disabled={isTogglingScreen}
             >
               {isScreenSharing ? 'Stop Sharing' : 'Share Screen'}
             </button>
-          </>
-        ) : (
-          <button className="btn btn-primary" onClick={join}>Join</button>
-        )}
-      </div>
+          </div>
+        </>
+      ) : null}
 
       <style jsx>{`
         .call-container {
@@ -310,6 +437,7 @@ export default function CallPage() {
           overflow: hidden;
           box-shadow: 0 10px 25px rgba(0,0,0,.35), inset 0 0 0 1px rgba(255,255,255,.06);
         }
+        
         .controls {
           margin-top: 18px;
           display: flex; gap: 10px; flex-wrap: wrap;
@@ -345,6 +473,20 @@ export default function CallPage() {
           50% { opacity: 0.7; }
         }
       `}</style>
+    </div>
+  );
+}
+
+function Countdown({ target, now }: { target: number; now: number }) {
+  const diff = Math.max(0, target - now);
+  const totalSeconds = Math.floor(diff / 1000);
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const seconds = totalSeconds % 60;
+  const pad = (n: number) => String(n).padStart(2, '0');
+  return (
+    <div style={{fontVariantNumeric:'tabular-nums',fontSize:18,marginTop:6}}>
+      {pad(hours)}:{pad(minutes)}:{pad(seconds)}
     </div>
   );
 }

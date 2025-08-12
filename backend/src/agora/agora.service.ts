@@ -6,6 +6,8 @@ import { v4 as uuidv4 } from 'uuid';
 export class AgoraService {
   private appId = process.env.AGORA_APP_ID || '';
   private appCertificate = process.env.AGORA_APP_CERTIFICATE || '';
+  // Simple in-memory store. Replace with DB in production.
+  private roomSchedules: Map<string, { startTimeMs: number; endTimeMs: number }> = new Map();
 
   generateToken(channelName: string, uid: string | number, role: 'publisher' | 'subscriber' = 'publisher', expireSeconds = 3600) {
     if (!this.appId || !this.appCertificate) {
@@ -20,5 +22,13 @@ export class AgoraService {
   createRoom() {
     // Generate a short id; you can store in DB if needed
     return uuidv4().split('-')[0];
+  }
+
+  setRoomSchedule(roomId: string, startTimeMs: number, endTimeMs: number) {
+    this.roomSchedules.set(roomId, { startTimeMs, endTimeMs });
+  }
+
+  getRoomSchedule(roomId: string): { startTimeMs: number; endTimeMs: number } | undefined {
+    return this.roomSchedules.get(roomId);
   }
 }

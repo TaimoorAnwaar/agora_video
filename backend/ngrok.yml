@@ -1,0 +1,12 @@
+version: " 2\ 
+# Set your authtoken once via: ngrok config add-authtoken <YOUR_TOKEN>
+# Or uncomment and paste here (not recommended to commit):
+# authtoken: <YOUR_TOKEN>
+
+tunnels:
+ backend:
+ addr: 3000
+ proto: http
+ frontend:
+ addr: 3001
+ proto: http

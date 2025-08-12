@@ -4,7 +4,8 @@
   "private": true,
   "scripts": {
     "dev": "next dev -p 3001",
-    "build": "next build",
+   "build": "next build && echo 'Lint skipped in build'",
+
     "start": "next start",
     "lint": "next lint"
   },
